@@ -31,42 +31,97 @@ window._qutebrowser.stylesheet = (function() {
     const svg_ns = "http://www.w3.org/2000/svg";
 
     let root_elem;
+    let root_key;
     let style_elem;
     let css_content = "";
 
-    let root_observer;
-    let initialized = false;
+    function is_stylesheet_applied(css) {
+        return style_elem && style_elem.textContent === css;
+    }
 
-    // Watch for rewrites of the root element and changes to its children,
-    // then move the stylesheet to the end. Partially inspired by Stylus:
-    // https://github.com/openstyles/stylus/blob/1.1.4.2/content/apply.js#L235-L355
-    function watch_root() {
+    function ensure_stylesheet_loaded() {
         if (!document.documentElement) {
-            root_observer.observe(document, {"childList": true});
-            return;
+            throw new Error(
+                "ensure_stylesheet_loaded called before DOM was available"
+            );
         }
 
-        if (root_elem !== document.documentElement) {
-            root_elem = document.documentElement;
-            root_observer.disconnect();
-            root_observer.observe(document, {"childList": true});
-            root_observer.observe(root_elem, {"childList": true});
+        if (style_elem) {
+            style_elem.textContent = css_content;
+        } else {
+            style_elem = create_style(css_content);
         }
+
         if (style_elem !== root_elem.lastChild) {
             root_elem.appendChild(style_elem);
         }
     }
 
+    function ensure_root_present() {
+        let waiting_interval;
+        function is_root_present() {
+            return document && document.documentElement;
+        }
+        return new Promise((resolve) => {
+            if (is_root_present()) {
+                root_elem = document.documentElement;
+                resolve(document.documentElement);
+            } else {
+                waiting_interval = setInterval(() => {
+                    if (!is_root_present()) {
+                        return;
+                    }
+                    clearInterval(waiting_interval);
+                    root_elem = document.documentElement;
+                    resolve(document.documentElement);
+                }, 100);
+            }
+        });
+    }
+
+    function wait_for_new_root() {
+        function is_new_root() {
+            return (
+                document.documentElement &&
+                document.documentElement.getAttribute("__qb_key") !==
+                    root_key &&
+                check_style(document.documentElement)
+            );
+        }
+        function setup_new_root(new_root_elem) {
+            root_elem = new_root_elem;
+            root_key = new Date().getTime();
+            root_elem.setAttribute("__qb_key", root_key);
+            // style_elem would refer to a node in the old page's dom
+            style_elem = null;
+            return root_elem;
+        }
+        return new Promise((resolve) => {
+            if (is_new_root()) {
+                resolve(setup_new_root(document.documentElement));
+            } else {
+                waiting_interval = setInterval(() => {
+                    if (!is_new_root()) {
+                      return;
+                    }
+                    clearInterval(waiting_interval);
+                    resolve(setup_new_root(document.documentElement));
+                }, 100);
+            }
+        });
+    }
+
     function create_style() {
         let ns = xhtml_ns;
-        if (document.documentElement &&
-            document.documentElement.namespaceURI === svg_ns) {
+        if (
+            document.documentElement &&
+            document.documentElement.namespaceURI === svg_ns
+        ) {
             ns = svg_ns;
         }
         style_elem = document.createElementNS(ns, "style");
         style_elem.textContent = css_content;
-        root_observer = new MutationObserver(watch_root);
-        watch_root();
+        return style_elem;
     }
 
     // We should only inject the stylesheet if the document already has style
@@ -75,74 +130,44 @@ window._qutebrowser.stylesheet = (function() {
     // starting point for exploring the relevant code in Chromium, see
     // https://github.com/qt/qtwebengine-chromium/blob/cfe8c60/chromium/third_party/WebKit/Source/core/xml/parser/XMLDocumentParser.cpp#L1539-L1540
     function check_style(node) {
-        const stylesheet = node.nodeType === Node.PROCESSING_INSTRUCTION_NODE &&
-                           node.target === "xml-stylesheet" &&
-                           node.parentNode === document;
-        const known_ns = node.nodeType === Node.ELEMENT_NODE &&
-                         (node.namespaceURI === xhtml_ns ||
-                          node.namespaceURI === svg_ns);
+        const stylesheet =
+            node.nodeType === Node.PROCESSING_INSTRUCTION_NODE &&
+            node.target === "xml-stylesheet" &&
+            node.parentNode === document;
+        const known_ns =
+            node.nodeType === Node.ELEMENT_NODE &&
+            (node.namespaceURI === xhtml_ns || node.namespaceURI === svg_ns);
         return stylesheet || known_ns;
     }
 
-    function init() {
-        initialized = true;
-        // Chromium will not rewrite a document inside a frame, so add the
-        // stylesheet even if the document is unstyled.
-        if (window !== window.top) {
-            create_style();
-            return;
-        }
-        const iter = document.createNodeIterator(document,
-            NodeFilter.SHOW_PROCESSING_INSTRUCTION | NodeFilter.SHOW_ELEMENT);
-        let node;
-        while ((node = iter.nextNode())) {
-            if (check_style(node)) {
-                create_style();
+    function set_css(css) {
+        ensure_root_present().then(() => {
+            if (is_stylesheet_applied(css)) {
                 return;
             }
-        }
-        const style_observer = new MutationObserver((mutations) => {
-            for (const mutation of mutations) {
-                const nodes = mutation.addedNodes;
-                for (let i = 0; i < nodes.length; ++i) {
-                    if (check_style(nodes[i])) {
-                        create_style();
-                        style_observer.disconnect();
-                        return;
-                    }
+            css_content = css;
+
+            ensure_stylesheet_loaded();
+            // Propagate the new CSS to all child frames.
+            // FIXME:qtwebengine This does not work for cross-origin frames.
+            for (let i = 0; i < window.frames.length; ++i) {
+                const frame = window.frames[i];
+                if (frame._qutebrowser && frame._qutebrowser.stylesheet) {
+                    frame._qutebrowser.stylesheet.set_css(css);
                 }
             }
         });
-        style_observer.observe(document, {"childList": true, "subtree": true});
     }
 
-    funcs.set_css = function(css) {
-        if (!initialized) {
-            init();
-        }
+    function set_new_page_css(css) {
+        wait_for_new_root().then(() => {
+            set_css(css);
+        });
+    }
 
-        if (css_content === css) {
-            return;
-        }
-
-        css_content = css;
-
-        if (style_elem) {
-            style_elem.textContent = css;
-            // The browser seems to rewrite the document in same-origin frames
-            // without notifying the mutation observer. Ensure that the
-            // stylesheet is in the current document.
-            watch_root();
-        }
-        // Propagate the new CSS to all child frames.
-        // FIXME:qtwebengine This does not work for cross-origin frames.
-        for (let i = 0; i < window.frames.length; ++i) {
-            const frame = window.frames[i];
-            if (frame._qutebrowser && frame._qutebrowser.stylesheet) {
-                frame._qutebrowser.stylesheet.set_css(css);
-            }
-        }
-    };
+    // exports
+    funcs.set_css = set_css;
+    funcs.set_new_page_css = set_new_page_css;
 
     return funcs;
 })();

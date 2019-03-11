@@ -976,7 +976,7 @@ class _WebEngineScripts(QObject):
         js_code = javascript.wrap_global(
             'stylesheet',
             utils.read_file('javascript/stylesheet.js'),
-            javascript.assemble('stylesheet', 'set_css', css),
+            javascript.assemble('stylesheet', 'set_new_page_css', css),
         )
         self._inject_early_js('stylesheet', js_code, subframes=True)
 
